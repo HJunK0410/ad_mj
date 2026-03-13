@@ -1,0 +1,2 @@
+experiment_name,description,metrics/precision(B),metrics/recall(B),metrics/mAP50(B),metrics/mAP50-95(B)
+crack_diff_alpha0.1_beta0.5_fpn16_19_22,"Diff Best (alpha=0.1, beta=0.5)",0.82309,0.66019,0.73329,0.55792

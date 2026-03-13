@@ -1,0 +1,6 @@
+path: /mnt/sda1/sjpm/sjpm1
+train: images/train_half
+val: images/val
+names:
+- Stamp
+- Stamp_line

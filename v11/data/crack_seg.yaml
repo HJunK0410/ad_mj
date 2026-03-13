@@ -1,0 +1,15 @@
+# Crack-seg dataset by Ultralytics
+# Documentation: https://docs.ultralytics.com/datasets/segment/crack-seg/
+
+# Train/val/test sets
+path: crack-seg  # dataset root dir (Ultralytics가 자동으로 ~/datasets/crack-seg에 다운로드)
+train: images/train  # 3717 images
+val: images/val      # 112 images
+test: images/test    # 200 images
+
+# Classes
+names:
+  0: crack
+
+# Download script/URL (optional)
+download: https://github.com/ultralytics/assets/releases/download/v0.0.0/crack-seg.zip

@@ -1,0 +1,2 @@
+experiment_name,description,metrics/precision(B),metrics/recall(B),metrics/mAP50(B),metrics/mAP50-95(B)
+crack_baseline,"Baseline (순수 YOLOv11m, NPP loss 비활성)",0.02941,0.08784,0.00831,0.00175

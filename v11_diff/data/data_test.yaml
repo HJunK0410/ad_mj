@@ -1,0 +1,7 @@
+names:
+- Stamp
+- Stamp_line
+path: /home/user/hyunjun/AD/data
+test: images/test
+train: images/train
+val: images/val

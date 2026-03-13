@@ -1,0 +1,6 @@
+path: /home/user/hyunjun/AD/data
+train: images/train
+val: images/val
+# Classes
+
+names:  ['Stamp','Stamp_line']

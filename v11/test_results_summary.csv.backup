@@ -1,0 +1,5 @@
+experiment_name,metrics/precision(B),metrics/recall(B),metrics/mAP50(B),metrics/mAP50-95(B)
+train_npp_l2d0.06_l1d0.02_mask0.1_fpn16_19_22,0.97163,1.0,0.99423,0.88535
+train_npp_l2d0.06_l1d0.02_mask0.1_fpn16_19_22,0.76095,0.62232,0.70677,0.4106
+train_npp_l2d0.06_l1d0.02_mask0.1_fpn16_19_22,0.76095,0.62232,0.70677,0.4106
+train_npp_l2d0.0_l1d0.08_mask0.1_fpn16_19_22,0.71812,0.61699,0.71505,0.43081

@@ -1,0 +1,10 @@
+version,iteration,save_dir,weight_path,weight_kind,split,status,metrics/precision(B),metrics/recall(B),metrics/mAP50(B),metrics/mAP50-95(B)
+v8,1,runs/detect/train_diff_alpha0.1_beta0.0_fpn15_18_21,/home/user/hyunjun/AD/v8_diff/runs/detect/train_diff_alpha0.1_beta0.0_fpn15_18_21/weights/best.pt,best.pt,test,success,0.980772,0.869067,0.962759,0.694048
+v8,2,runs/detect/train_diff_alpha0.0_beta1.0_fpn15_18_21,/home/user/hyunjun/AD/v8_diff/runs/detect/train_diff_alpha0.0_beta1.0_fpn15_18_21/weights/best.pt,best.pt,test,success,0.961702,0.896392,0.966208,0.699784
+v8,3,runs/detect/train_diff_alpha0.3_beta1.5_fpn15_18_21,/home/user/hyunjun/AD/v8_diff/runs/detect/train_diff_alpha0.3_beta1.5_fpn15_18_21/weights/best.pt,best.pt,test,success,0.946755,0.929192,0.966174,0.697970
+v10,1,runs/detect/train_diff_alpha0.3_beta0.5_fpn16_19_22,/home/user/hyunjun/AD/v10_diff/runs/detect/train_diff_alpha0.3_beta0.5_fpn16_19_22/weights/best.pt,best.pt,test,success,0.851820,0.849639,0.913619,0.657386
+v10,2,runs/detect/train_diff_alpha0.3_beta0.0_fpn16_19_22,/home/user/hyunjun/AD/v10_diff/runs/detect/train_diff_alpha0.3_beta0.0_fpn16_19_22/weights/best.pt,best.pt,test,success,0.967761,0.758830,0.913392,0.687740
+v10,3,runs/detect/train_diff_alpha0.3_beta1.5_fpn16_19_22,/home/user/hyunjun/AD/v10_diff/runs/detect/train_diff_alpha0.3_beta1.5_fpn16_19_22/weights/best.pt,best.pt,test,success,0.786942,0.820770,0.873208,0.634471
+v11,1,runs/detect/train_diff_alpha0.0_beta0.5_fpn16_19_22,/home/user/hyunjun/AD/v11_diff/runs/detect/train_diff_alpha0.0_beta0.5_fpn16_19_22/weights/best.pt,best.pt,test,success,0.916528,0.947875,0.965321,0.652685
+v11,2,runs/detect/train_diff_alpha0.0_beta2.0_fpn16_19_22,/home/user/hyunjun/AD/v11_diff/runs/detect/train_diff_alpha0.0_beta2.0_fpn16_19_22/weights/best.pt,best.pt,test,success,0.940260,0.889087,0.944144,0.695686
+v11,3,runs/detect/train_diff_alpha0.5_beta1.0_fpn16_19_22,/home/user/hyunjun/AD/v11_diff/runs/detect/train_diff_alpha0.5_beta1.0_fpn16_19_22/weights/best.pt,best.pt,test,success,0.922636,0.942708,0.951164,0.698032

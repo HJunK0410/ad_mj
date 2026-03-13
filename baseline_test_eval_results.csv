@@ -1,0 +1,4 @@
+version,run_name,save_dir,weight_path,weight_kind,split,status,metrics/precision(B),metrics/recall(B),metrics/mAP50(B),metrics/mAP50-95(B)
+v8,baseline_stage2_v8,runs/detect_baseline/baseline_stage2_v8,/home/user/hyunjun/AD/v8/runs/detect_baseline/baseline_stage2_v8/weights/best.pt,best.pt,test,success_cpu_fallback,0.937431,0.885676,0.944374,0.660209
+v10,baseline_stage2_v10,runs/detect_baseline/baseline_stage2_v10,/home/user/hyunjun/AD/v10/runs/detect_baseline/baseline_stage2_v10/weights/best.pt,best.pt,test,success_cpu_fallback,0.874760,0.860540,0.922326,0.661300
+v11,baseline_stage2_v11,runs/detect_baseline/baseline_stage2_v11,/home/user/hyunjun/AD/v11/runs/detect_baseline/baseline_stage2_v11/weights/best.pt,best.pt,test,success_cpu_fallback,0.984829,0.848277,0.944699,0.659429

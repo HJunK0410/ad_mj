@@ -1,0 +1,26 @@
+# Exclude runs
+v8/runs/
+v8_diff/runs/
+v10/runs/
+v10_diff/runs/
+v11/runs/
+v11_diff/runs/
+
+# Cache
+__pycache__/
+**/__pycache__/
+*.pyc
+.cache/
+**/.cache/
+**/cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Optional large artifacts
+*.pt
+*.pth
+*.onnx
+*.engine
+*.zip

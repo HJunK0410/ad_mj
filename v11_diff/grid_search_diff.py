@@ -8,6 +8,7 @@ import csv
 import os
 import re
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -20,7 +21,7 @@ os.environ["PYTHONPATH"] = str(script_dir) + ":" + os.environ.get("PYTHONPATH", 
 FOLDER_VERSION = script_dir.name  # v8_diff, v10_diff, v11_diff
 SOURCE_VERSION = FOLDER_VERSION.replace("_diff", "")
 DIFF_CSV = Path("/home/user/hyunjun/AD/diff_test_eval_results.csv")
-REDUCED_RESULTS_DIR = Path("/home/user/hyunjun/ad/reduced_train")
+REDUCED_RESULTS_DIR = Path("/home/user/hyunjun/AD/reduced_train")
 REDUCED_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_CSV = REDUCED_RESULTS_DIR / f"{FOLDER_VERSION}_top3_subset_results.csv"
 
@@ -35,6 +36,7 @@ EPOCHS = 400
 PATIENCE = 20
 BATCH = 4
 DEVICE = 0
+PYTHON_BIN = os.environ.get("PYTHON_BIN") or sys.executable
 
 
 def parse_diff_from_save_dir(save_dir: str):
@@ -137,7 +139,7 @@ def main():
             project_dir = f"runs/detect_{ratio}"
             print(f"\n[{step}/{total}] diff ratio={ratio} 실행")
             cmd = [
-                "python",
+                PYTHON_BIN,
                 "train.py",
                 f"--npp_alpha={exp['npp_alpha']}",
                 f"--npp_beta={exp['npp_beta']}",

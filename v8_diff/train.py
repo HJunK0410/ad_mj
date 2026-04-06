@@ -99,9 +99,19 @@ npp_params = {
 
 # 하이퍼파라미터 기반 프로젝트 이름 생성
 FPN_STR = hyperparams['npp_fpn_sources'].replace(',', '_')
-# 차분로스가 활성화된 경우 차분로스 이름 사용
+# 차분+NPP 동시 사용 시 run 이름이 겹치지 않도록 조합 접두어 사용
 if hyperparams['diff_alpha'] > 0.0 or hyperparams['diff_beta'] > 0.0:
-    PROJECT_NAME = f"train_diff_alpha{hyperparams['diff_alpha']}_beta{hyperparams['diff_beta']}_fpn{FPN_STR}"
+    if hyperparams['npp_lambda_2d'] > 0.0 or hyperparams['npp_lambda_1d'] > 0.0:
+        PROJECT_NAME = (
+            f"train_combo_l2d{hyperparams['npp_lambda_2d']}_l1d{hyperparams['npp_lambda_1d']}_"
+            f"mask{hyperparams['npp_bbox_mask_weight']}_fpn{FPN_STR}_"
+            f"dalpha{hyperparams['diff_alpha']}_dbeta{hyperparams['diff_beta']}"
+        )
+    else:
+        PROJECT_NAME = (
+            f"train_diff_alpha{hyperparams['diff_alpha']}_beta{hyperparams['diff_beta']}_"
+            f"mask{hyperparams['npp_bbox_mask_weight']}_fpn{FPN_STR}"
+        )
 else:
     PROJECT_NAME = f"train_npp_l2d{hyperparams['npp_lambda_2d']}_l1d{hyperparams['npp_lambda_1d']}_mask{hyperparams['npp_bbox_mask_weight']}_fpn{FPN_STR}"
 

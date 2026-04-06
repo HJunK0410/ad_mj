@@ -5,6 +5,7 @@ v10/runs/
 v10_diff/runs/
 v11/runs/
 v11_diff/runs/
+data 
 
 # Cache
 __pycache__/
@@ -24,3 +25,7 @@ __pycache__/
 *.onnx
 *.engine
 *.zip
+*.txt
+*.cache
+*.log
+*.out

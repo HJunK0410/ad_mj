@@ -17,8 +17,15 @@ echo "시작 시간: $(date)"
 echo "=========================================="
 echo ""
 
+PYTHON_BIN_DEFAULT="$(command -v python3 || true)"
+PYTHON_BIN="${PYTHON_BIN:-${PYTHON_BIN_DEFAULT}}"
+if [[ -z "${PYTHON_BIN}" || ! -x "${PYTHON_BIN}" ]]; then
+    echo "Python 실행 파일을 찾지 못했습니다. PYTHON_BIN을 절대경로로 지정하세요."
+    exit 1
+fi
+
 # Python Grid Search 스크립트 실행
-if python grid_search_npp.py; then
+if "${PYTHON_BIN}" grid_search_npp.py; then
     echo ""
     echo "=========================================="
     echo "Grid Search 완료!"

@@ -1,0 +1,583 @@
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+"""
+DETR model and criterion classes.
+"""
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+from util import box_ops
+from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
+                       accuracy, get_world_size, interpolate,
+                       is_dist_avail_and_initialized)
+
+from .backbone import build_backbone
+from .matcher import build_matcher
+from .segmentation import (DETRsegm, PostProcessPanoptic, PostProcessSegm,
+                           dice_loss, sigmoid_focal_loss)
+from .transformer import build_transformer
+try:
+    from twimcustom import ContinuityHead, ContinuityHead2D, npp_loss, npp_loss_2d
+except ImportError:
+    ContinuityHead = None
+    ContinuityHead2D = None
+    npp_loss = None
+    npp_loss_2d = None
+
+
+class DETR(nn.Module):
+    """ This is the DETR module that performs object detection """
+    def __init__(self, backbone, transformer, num_classes, num_queries, aux_loss=False, 
+                 continuity_head_2d=None, continuity_head_1d=None):
+        """ Initializes the model.
+        Parameters:
+            backbone: torch module of the backbone to be used. See backbone.py
+            transformer: torch module of the transformer architecture. See transformer.py
+            num_classes: number of object classes
+            num_queries: number of object queries, ie detection slot. This is the maximal number of objects
+                         DETR can detect in a single image. For COCO, we recommend 100 queries.
+            aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
+            continuity_head_2d: ContinuityHead2D instance for 2D continuity loss (optional)
+            continuity_head_1d: ContinuityHead instance for 1D continuity loss (optional)
+        """
+        super().__init__()
+        self.num_queries = num_queries
+        self.transformer = transformer
+        hidden_dim = transformer.d_model
+        self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
+        self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
+        self.query_embed = nn.Embedding(num_queries, hidden_dim)
+        self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
+        self.backbone = backbone
+        self.aux_loss = aux_loss
+        self.continuity_head_2d = continuity_head_2d
+        self.continuity_head_1d = continuity_head_1d
+
+    def forward(self, samples: NestedTensor):
+        """ The forward expects a NestedTensor, which consists of:
+               - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
+               - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
+
+            It returns a dict with the following elements:
+               - "pred_logits": the classification logits (including no-object) for all queries.
+                                Shape= [batch_size x num_queries x (num_classes + 1)]
+               - "pred_boxes": The normalized boxes coordinates for all queries, represented as
+                               (center_x, center_y, height, width). These values are normalized in [0, 1],
+                               relative to the size of each individual image (disregarding possible padding).
+                               See PostProcess for information on how to retrieve the unnormalized bounding box.
+               - "aux_outputs": Optional, only returned when auxilary losses are activated. It is a list of
+                                dictionnaries containing the two above keys for each decoder layer.
+        """
+        if isinstance(samples, (list, torch.Tensor)):
+            samples = nested_tensor_from_tensor_list(samples)
+        features, pos = self.backbone(samples)
+
+        src, mask = features[-1].decompose()
+        assert mask is not None
+        hs = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos[-1])[0]
+
+        outputs_class = self.class_embed(hs)
+        outputs_coord = self.bbox_embed(hs).sigmoid()
+        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+        if self.aux_loss:
+            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
+        
+        # Continuity loss features 추출
+        if self.continuity_head_2d is not None:
+            z_2d, z_hat_2d, hw_2d = self.continuity_head_2d(src)
+            out['continuity_2d'] = {'z': z_2d, 'z_hat': z_hat_2d, 'hw': hw_2d}
+        
+        if self.continuity_head_1d is not None:
+            z_1d, z_hat_1d, hw_1d = self.continuity_head_1d(src)
+            out['continuity_1d'] = {'z': z_1d, 'z_hat': z_hat_1d, 'hw': hw_1d}
+        
+        return out
+
+    @torch.jit.unused
+    def _set_aux_loss(self, outputs_class, outputs_coord):
+        # this is a workaround to make torchscript happy, as torchscript
+        # doesn't support dictionary with non-homogeneous values, such
+        # as a dict having both a Tensor and a list.
+        return [{'pred_logits': a, 'pred_boxes': b}
+                for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
+
+
+class SetCriterion(nn.Module):
+    """ This class computes the loss for DETR.
+    The process happens in two steps:
+        1) we compute hungarian assignment between ground truth boxes and the outputs of the model
+        2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
+    """
+    def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses,
+                 curriculum_epochs=5, norm_mask_bbox_coef=0.3,
+                 base_lambda_cont_2d=0.0, base_lambda_cont_1d=0.0):
+        """ Create the criterion.
+        Parameters:
+            num_classes: number of object categories, omitting the special no-object category
+            matcher: module able to compute a matching between targets and proposals
+            weight_dict: dict containing as key the names of the losses and as values their relative weight.
+            eos_coef: relative classification weight applied to the no-object category
+            losses: list of all the losses to be applied. See get_loss for list of available losses.
+            curriculum_epochs: number of epochs for curriculum learning
+            norm_mask_bbox_coef: normalization mask coefficient for bbox regions
+            base_lambda_cont_2d: base weight for 2D continuity loss
+            base_lambda_cont_1d: base weight for 1D continuity loss
+        """
+        super().__init__()
+        self.num_classes = num_classes
+        self.matcher = matcher
+        self.weight_dict = weight_dict
+        self.eos_coef = eos_coef
+        self.losses = losses
+        self.curriculum_epochs = curriculum_epochs
+        self.norm_mask_bbox_coef = norm_mask_bbox_coef
+        self.base_lambda_cont_2d = base_lambda_cont_2d
+        self.base_lambda_cont_1d = base_lambda_cont_1d
+        empty_weight = torch.ones(self.num_classes + 1)
+        empty_weight[-1] = self.eos_coef
+        self.register_buffer('empty_weight', empty_weight)
+
+    def update_curriculum_lambda(self, epoch):
+        """Update continuity loss weights based on curriculum learning schedule."""
+        if epoch < self.curriculum_epochs:
+            # Gradually increase lambda from 0 to base_lambda
+            lambda_cont_2d = self.base_lambda_cont_2d * min(1.0, max(0.0, (epoch + 1) / self.curriculum_epochs))
+            lambda_cont_1d = self.base_lambda_cont_1d * min(1.0, max(0.0, (epoch + 1) / self.curriculum_epochs))
+        else:
+            lambda_cont_2d = self.base_lambda_cont_2d
+            lambda_cont_1d = self.base_lambda_cont_1d
+        
+        # Update weight_dict
+        if 'loss_continuity_2d' in self.weight_dict:
+            self.weight_dict['loss_continuity_2d'] = lambda_cont_2d
+        if 'loss_continuity_1d' in self.weight_dict:
+            self.weight_dict['loss_continuity_1d'] = lambda_cont_1d
+
+    def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
+        """Classification loss (NLL)
+        targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
+        """
+        assert 'pred_logits' in outputs
+        src_logits = outputs['pred_logits']
+
+        idx = self._get_src_permutation_idx(indices)
+        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+        target_classes = torch.full(src_logits.shape[:2], self.num_classes,
+                                    dtype=torch.int64, device=src_logits.device)
+        target_classes[idx] = target_classes_o
+
+        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
+        losses = {'loss_ce': loss_ce}
+
+        if log:
+            # TODO this should probably be a separate loss, not hacked in this one here
+            losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0]
+        return losses
+
+    @torch.no_grad()
+    def loss_cardinality(self, outputs, targets, indices, num_boxes):
+        """ Compute the cardinality error, ie the absolute error in the number of predicted non-empty boxes
+        This is not really a loss, it is intended for logging purposes only. It doesn't propagate gradients
+        """
+        pred_logits = outputs['pred_logits']
+        device = pred_logits.device
+        tgt_lengths = torch.as_tensor([len(v["labels"]) for v in targets], device=device)
+        # Count the number of predictions that are NOT "no-object" (which is the last class)
+        card_pred = (pred_logits.argmax(-1) != pred_logits.shape[-1] - 1).sum(1)
+        card_err = F.l1_loss(card_pred.float(), tgt_lengths.float())
+        losses = {'cardinality_error': card_err}
+        return losses
+
+    def loss_boxes(self, outputs, targets, indices, num_boxes):
+        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
+           targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
+           The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
+        """
+        assert 'pred_boxes' in outputs
+        idx = self._get_src_permutation_idx(indices)
+        src_boxes = outputs['pred_boxes'][idx]
+        target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+
+        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
+
+        losses = {}
+        losses['loss_bbox'] = loss_bbox.sum() / num_boxes
+
+        loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
+            box_ops.box_cxcywh_to_xyxy(src_boxes),
+            box_ops.box_cxcywh_to_xyxy(target_boxes)))
+        losses['loss_giou'] = loss_giou.sum() / num_boxes
+        return losses
+
+    def loss_masks(self, outputs, targets, indices, num_boxes):
+        """Compute the losses related to the masks: the focal loss and the dice loss.
+           targets dicts must contain the key "masks" containing a tensor of dim [nb_target_boxes, h, w]
+        """
+        assert "pred_masks" in outputs
+
+        src_idx = self._get_src_permutation_idx(indices)
+        tgt_idx = self._get_tgt_permutation_idx(indices)
+        src_masks = outputs["pred_masks"]
+        src_masks = src_masks[src_idx]
+        masks = [t["masks"] for t in targets]
+        # TODO use valid to mask invalid areas due to padding in loss
+        target_masks, valid = nested_tensor_from_tensor_list(masks).decompose()
+        target_masks = target_masks.to(src_masks)
+        target_masks = target_masks[tgt_idx]
+
+        # upsample predictions to the target size
+        src_masks = interpolate(src_masks[:, None], size=target_masks.shape[-2:],
+                                mode="bilinear", align_corners=False)
+        src_masks = src_masks[:, 0].flatten(1)
+
+        target_masks = target_masks.flatten(1)
+        target_masks = target_masks.view(src_masks.shape)
+        losses = {
+            "loss_mask": sigmoid_focal_loss(src_masks, target_masks, num_boxes),
+            "loss_dice": dice_loss(src_masks, target_masks, num_boxes),
+        }
+        return losses
+
+    def _get_src_permutation_idx(self, indices):
+        # permute predictions following indices
+        batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
+        src_idx = torch.cat([src for (src, _) in indices])
+        return batch_idx, src_idx
+
+    def _get_tgt_permutation_idx(self, indices):
+        # permute targets following indices
+        batch_idx = torch.cat([torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)])
+        tgt_idx = torch.cat([tgt for (_, tgt) in indices])
+        return batch_idx, tgt_idx
+
+    def loss_continuity_2d(self, outputs, targets, indices, num_boxes):
+        """Compute 2D continuity loss with norm mask"""
+        if 'continuity_2d' not in outputs or npp_loss_2d is None:
+            return {}
+        cont_data = outputs['continuity_2d']
+        z = cont_data['z']
+        z_hat = cont_data['z_hat']
+        hw = cont_data.get('hw', None)
+        
+        # Create norm mask from bbox regions
+        norm_mask = None
+        if len(targets) > 0:
+            # Get H, W from hw or z shape
+            if hw is not None and isinstance(hw, (tuple, list)) and len(hw) >= 2:
+                H, W = int(hw[0]), int(hw[1])
+            else:
+                # If hw is not available, get shape from z
+                H, W = z.shape[-2], z.shape[-1]
+            
+            B = z.shape[0]
+            device = z.device
+            norm_mask = torch.ones(B, 1, H, W, device=device)
+            
+            # Fill bbox regions with norm_mask_bbox_coef
+            for b, target in enumerate(targets):
+                if 'boxes' in target and len(target['boxes']) > 0:
+                    boxes = target['boxes']  # [N, 4] in format [center_x, center_y, w, h] normalized
+                    for box in boxes:
+                        # Handle both tensor and list/tuple
+                        if isinstance(box, torch.Tensor):
+                            cx, cy, w, h = box[0].item(), box[1].item(), box[2].item(), box[3].item()
+                        else:
+                            cx, cy, w, h = float(box[0]), float(box[1]), float(box[2]), float(box[3])
+                        
+                        # Convert normalized coordinates to pixel coordinates
+                        x1 = max(0, min(int((cx - w / 2) * W), W - 1))
+                        y1 = max(0, min(int((cy - h / 2) * H), H - 1))
+                        x2 = max(0, min(int((cx + w / 2) * W), W - 1))
+                        y2 = max(0, min(int((cy + h / 2) * H), H - 1))
+                        norm_mask[b, :, y1:y2 + 1, x1:x2 + 1] = self.norm_mask_bbox_coef
+        
+        loss = npp_loss_2d(z, z_hat, norm_mask=norm_mask, mode='l1')
+        return {'loss_continuity_2d': loss}
+    
+    def loss_continuity_1d(self, outputs, targets, indices, num_boxes):
+        """Compute 1D continuity loss with norm mask"""
+        if 'continuity_1d' not in outputs or npp_loss is None:
+            return {}
+        cont_data = outputs['continuity_1d']
+        z = cont_data['z']
+        z_hat = cont_data['z_hat']
+        hw = cont_data.get('hw', None)
+        
+        # Create norm mask from bbox regions (flattened for 1D)
+        norm_mask = None
+        if len(targets) > 0:
+            # Get H, W from hw or z shape
+            if hw is not None and isinstance(hw, (tuple, list)) and len(hw) >= 2:
+                H, W = int(hw[0]), int(hw[1])
+            else:
+                # If hw is not available, infer from z shape
+                # For 1D, z is [B, T, D] where T = H * W
+                # We need to infer H, W from the original feature map
+                # Since we don't have direct access, we'll use a reasonable default
+                # or try to infer from the continuity head's expected output
+                # For now, we'll skip norm_mask if hw is not available
+                H, W = None, None
+            
+            if H is not None and W is not None:
+                B = z.shape[0]
+                device = z.device
+                norm_mask_2d = torch.ones(B, 1, H, W, device=device)
+                
+                # Fill bbox regions with norm_mask_bbox_coef
+                for b, target in enumerate(targets):
+                    if 'boxes' in target and len(target['boxes']) > 0:
+                        boxes = target['boxes']  # [N, 4] in format [center_x, center_y, w, h] normalized
+                        for box in boxes:
+                            # Handle both tensor and list/tuple
+                            if isinstance(box, torch.Tensor):
+                                cx, cy, w, h = box[0].item(), box[1].item(), box[2].item(), box[3].item()
+                            else:
+                                cx, cy, w, h = float(box[0]), float(box[1]), float(box[2]), float(box[3])
+                            
+                            # Convert normalized coordinates to pixel coordinates
+                            x1 = max(0, min(int((cx - w / 2) * W), W - 1))
+                            y1 = max(0, min(int((cy - h / 2) * H), H - 1))
+                            x2 = max(0, min(int((cx + w / 2) * W), W - 1))
+                            y2 = max(0, min(int((cy + h / 2) * H), H - 1))
+                            norm_mask_2d[b, :, y1:y2 + 1, x1:x2 + 1] = self.norm_mask_bbox_coef
+                
+                # Flatten for 1D: [B, T] where T = H * W
+                norm_mask = norm_mask_2d.flatten(2).squeeze(1)  # [B, H*W]
+        
+        loss = npp_loss(z, z_hat, norm_mask=norm_mask, mode='l1')
+        return {'loss_continuity_1d': loss}
+
+    def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
+        loss_map = {
+            'labels': self.loss_labels,
+            'cardinality': self.loss_cardinality,
+            'boxes': self.loss_boxes,
+            'masks': self.loss_masks,
+            'continuity_2d': self.loss_continuity_2d,
+            'continuity_1d': self.loss_continuity_1d
+        }
+        assert loss in loss_map, f'do you really want to compute {loss} loss?'
+        return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
+
+    def forward(self, outputs, targets):
+        """ This performs the loss computation.
+        Parameters:
+             outputs: dict of tensors, see the output specification of the model for the format
+             targets: list of dicts, such that len(targets) == batch_size.
+                      The expected keys in each dict depends on the losses applied, see each loss' doc
+        """
+        outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
+
+        # Retrieve the matching between the outputs of the last layer and the targets
+        indices = self.matcher(outputs_without_aux, targets)
+
+        # Compute the average number of target boxes accross all nodes, for normalization purposes
+        num_boxes = sum(len(t["labels"]) for t in targets)
+        num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=next(iter(outputs.values())).device)
+        if is_dist_avail_and_initialized():
+            torch.distributed.all_reduce(num_boxes)
+        num_boxes = torch.clamp(num_boxes / get_world_size(), min=1).item()
+
+        # Compute all the requested losses
+        losses = {}
+        for loss in self.losses:
+            losses.update(self.get_loss(loss, outputs, targets, indices, num_boxes))
+
+        # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
+        if 'aux_outputs' in outputs:
+            for i, aux_outputs in enumerate(outputs['aux_outputs']):
+                indices = self.matcher(aux_outputs, targets)
+                for loss in self.losses:
+                    if loss == 'masks':
+                        # Intermediate masks losses are too costly to compute, we ignore them.
+                        continue
+                    kwargs = {}
+                    if loss == 'labels':
+                        # Logging is enabled only for the last layer
+                        kwargs = {'log': False}
+                    l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes, **kwargs)
+                    l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
+                    losses.update(l_dict)
+
+        return losses
+
+
+class PostProcess(nn.Module):
+    """ This module converts the model's output into the format expected by the coco api"""
+    @torch.no_grad()
+    def forward(self, outputs, target_sizes):
+        """ Perform the computation
+        Parameters:
+            outputs: raw outputs of the model
+            target_sizes: tensor of dimension [batch_size x 2] containing the size of each images of the batch
+                          For evaluation, this must be the original image size (before any data augmentation)
+                          For visualization, this should be the image size after data augment, but before padding
+        """
+        out_logits, out_bbox = outputs['pred_logits'], outputs['pred_boxes']
+
+        assert len(out_logits) == len(target_sizes)
+        assert target_sizes.shape[1] == 2
+
+        prob = F.softmax(out_logits, -1)
+        scores, labels = prob[..., :-1].max(-1)
+
+        # convert to [x0, y0, x1, y1] format
+        boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)
+        # and from relative [0, 1] to absolute [0, height] coordinates
+        img_h, img_w = target_sizes.unbind(1)
+        scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
+        boxes = boxes * scale_fct[:, None, :]
+
+        results = [{'scores': s, 'labels': l, 'boxes': b} for s, l, b in zip(scores, labels, boxes)]
+
+        return results
+
+
+class MLP(nn.Module):
+    """ Very simple multi-layer perceptron (also called FFN)"""
+
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
+        super().__init__()
+        self.num_layers = num_layers
+        h = [hidden_dim] * (num_layers - 1)
+        self.layers = nn.ModuleList(nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
+
+    def forward(self, x):
+        for i, layer in enumerate(self.layers):
+            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
+        return x
+
+
+def build(args):
+    # the `num_classes` naming here is somewhat misleading.
+    # it indeed corresponds to `max_obj_id + 1`, where max_obj_id
+    # is the maximum id for a class in your dataset. For example,
+    # COCO has a max_obj_id of 90, so we pass `num_classes` to be 91.
+    # As another example, for a dataset that has a single class with id 1,
+    # you should pass `num_classes` to be 2 (max_obj_id + 1).
+    # For more details on this, check the following discussion
+    # https://github.com/facebookresearch/detr/issues/108#issuecomment-650269223
+    num_classes = 20 if args.dataset_file != 'coco' else 91
+    if args.dataset_file == "coco_panoptic":
+        # for panoptic, we just add a num_classes that is large enough to hold
+        # max_obj_id + 1, but the exact value doesn't really matter
+        num_classes = 250
+    device = torch.device(args.device)
+
+    backbone = build_backbone(args)
+
+    transformer = build_transformer(args)
+    
+    # Continuity heads 초기화
+    continuity_head_2d = None
+    continuity_head_1d = None
+    if hasattr(args, 'lambda_cont_2d') and args.lambda_cont_2d > 0:
+        if ContinuityHead2D is not None:
+            backbone_channels = backbone.num_channels
+            continuity_head_2d = ContinuityHead2D(in_ch=backbone_channels, d=args.hidden_dim, k=3)
+            continuity_head_2d.to(device)
+            print(f"✓ ContinuityHead2D 초기화 완료 (lambda={args.lambda_cont_2d})")
+        else:
+            print("⚠️  WARNING: ContinuityHead2D를 import할 수 없습니다. 2D continuity loss를 사용하지 않습니다.")
+    
+    if hasattr(args, 'lambda_cont_1d') and args.lambda_cont_1d > 0:
+        if ContinuityHead is not None:
+            backbone_channels = backbone.num_channels
+            continuity_head_1d = ContinuityHead(in_ch=backbone_channels, d=args.hidden_dim, k=3)
+            continuity_head_1d.to(device)
+            print(f"✓ ContinuityHead 초기화 완료 (lambda={args.lambda_cont_1d})")
+        else:
+            print("⚠️  WARNING: ContinuityHead를 import할 수 없습니다. 1D continuity loss를 사용하지 않습니다.")
+    
+    model = DETR(
+        backbone,
+        transformer,
+        num_classes=num_classes,
+        num_queries=args.num_queries,
+        aux_loss=args.aux_loss,
+        continuity_head_2d=continuity_head_2d,
+        continuity_head_1d=continuity_head_1d,
+    )
+    
+    # DETR 사전학습 가중치 자동 로드 (YOLO 데이터셋 사용 시에도)
+    # frozen_weights가 지정되지 않은 경우에만 자동 로드
+    if args.frozen_weights is None and args.dataset_file != 'coco':
+        try:
+            print("=" * 60)
+            print("🔄 DETR 사전학습 가중치 자동 로드 중...")
+            print("   (YOLO 데이터셋 사용 시 transformer 가중치를 로드합니다)")
+            print("=" * 60)
+            checkpoint = torch.hub.load_state_dict_from_url(
+                'https://dl.fbaipublicfiles.com/detr/detr-r50-e632da11.pth',
+                map_location='cpu', check_hash=True)
+            pretrained_dict = checkpoint['model']
+            model_dict = model.state_dict()
+            # class_embed는 제외 (클래스 수가 다를 수 있음)
+            # bbox_embed는 로드 (bbox 예측은 클래스와 무관하므로 유용함)
+            # continuity_head는 제외 (새로 추가된 모듈)
+            pretrained_dict = {k: v for k, v in pretrained_dict.items() 
+                              if k in model_dict and 'class_embed' not in k 
+                              and 'continuity_head' not in k
+                              and model_dict[k].shape == v.shape}
+            model_dict.update(pretrained_dict)
+            model.load_state_dict(model_dict, strict=False)
+            print(f"✓ DETR 사전학습 가중치 로드 완료: {len(pretrained_dict)}개 레이어 로드됨")
+            print(f"  (class_embed는 제외되어 새로 초기화됨, bbox_embed는 로드됨)")
+            print("=" * 60)
+        except Exception as e:
+            print(f"⚠️  WARNING: DETR 사전학습 가중치 로드 실패: {e}")
+            print("   랜덤 초기화로 학습을 시작합니다.")
+            print("   성능이 낮을 수 있습니다. --frozen_weights로 직접 지정하거나")
+            print("   인터넷 연결을 확인하세요.")
+    
+    if args.masks:
+        model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))
+    matcher = build_matcher(args)
+    weight_dict = {'loss_ce': 1, 'loss_bbox': args.bbox_loss_coef}
+    weight_dict['loss_giou'] = args.giou_loss_coef
+    if args.masks:
+        weight_dict["loss_mask"] = args.mask_loss_coef
+        weight_dict["loss_dice"] = args.dice_loss_coef
+    
+    # Continuity loss 가중치 추가
+    if hasattr(args, 'lambda_cont_2d') and args.lambda_cont_2d > 0:
+        weight_dict['loss_continuity_2d'] = args.lambda_cont_2d
+    if hasattr(args, 'lambda_cont_1d') and args.lambda_cont_1d > 0:
+        weight_dict['loss_continuity_1d'] = args.lambda_cont_1d
+    
+    # TODO this is a hack
+    if args.aux_loss:
+        aux_weight_dict = {}
+        for i in range(args.dec_layers - 1):
+            aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
+        weight_dict.update(aux_weight_dict)
+
+    losses = ['labels', 'boxes', 'cardinality']
+    if args.masks:
+        losses += ["masks"]
+    if hasattr(args, 'lambda_cont_2d') and args.lambda_cont_2d > 0:
+        losses.append('continuity_2d')
+    if hasattr(args, 'lambda_cont_1d') and args.lambda_cont_1d > 0:
+        losses.append('continuity_1d')
+    
+    # Get curriculum learning and norm mask parameters
+    curriculum_epochs = getattr(args, 'curriculum_epochs', 5)
+    norm_mask_bbox_coef = getattr(args, 'norm_mask_bbox_coef', 0.3)
+    base_lambda_cont_2d = getattr(args, 'lambda_cont_2d', 0.0)
+    base_lambda_cont_1d = getattr(args, 'lambda_cont_1d', 0.0)
+    
+    criterion = SetCriterion(num_classes, matcher=matcher, weight_dict=weight_dict,
+                             eos_coef=args.eos_coef, losses=losses,
+                             curriculum_epochs=curriculum_epochs,
+                             norm_mask_bbox_coef=norm_mask_bbox_coef,
+                             base_lambda_cont_2d=base_lambda_cont_2d,
+                             base_lambda_cont_1d=base_lambda_cont_1d)
+    criterion.to(device)
+    postprocessors = {'bbox': PostProcess()}
+    if args.masks:
+        postprocessors['segm'] = PostProcessSegm()
+        if args.dataset_file == "coco_panoptic":
+            is_thing_map = {i: i <= 90 for i in range(201)}
+            postprocessors["panoptic"] = PostProcessPanoptic(is_thing_map, threshold=0.85)
+
+    return model, criterion, postprocessors

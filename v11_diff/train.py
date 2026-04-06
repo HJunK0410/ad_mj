@@ -9,7 +9,11 @@ def parse_args():
     npp_alpha = 0.3  # 1차 차분 가중치
     npp_beta = 1.0   # 2차 차분 가중치
     npp_fpn_sources = "16,19,22"  # 기본값: 모든 레벨 사용
-    
+    # multi(NPP) continuity 가중치 — 미지정 시 trainer 기본(0.02/0.06)과 동일
+    npp_lambda_2d = 0.02
+    npp_lambda_1d = 0.06
+    npp_bbox_mask_weight = 1.0  # trainer 기본과 동일; grid에서는 0.1~0.3 전달 가능
+
     # 표준 파라미터 기본값
     batch = 2
     device = "3"
@@ -28,6 +32,12 @@ def parse_args():
             npp_beta = float(arg.split('=')[1])
         elif arg.startswith('--npp_fpn_sources='):
             npp_fpn_sources = arg.split('=')[1]
+        elif arg.startswith('--npp_lambda_2d='):
+            npp_lambda_2d = float(arg.split('=')[1])
+        elif arg.startswith('--npp_lambda_1d='):
+            npp_lambda_1d = float(arg.split('=')[1])
+        elif arg.startswith('--npp_bbox_mask_weight='):
+            npp_bbox_mask_weight = float(arg.split('=')[1])
         elif arg.startswith('--batch='):
             batch = int(arg.split('=')[1])
         elif arg.startswith('--device='):
@@ -51,6 +61,9 @@ def parse_args():
         'npp_alpha': npp_alpha,
         'npp_beta': npp_beta,
         'npp_fpn_sources': npp_fpn_sources,
+        'npp_lambda_2d': npp_lambda_2d,
+        'npp_lambda_1d': npp_lambda_1d,
+        'npp_bbox_mask_weight': npp_bbox_mask_weight,
         'batch': batch,
         'device': device,
         'epochs': epochs,
@@ -68,16 +81,42 @@ hyperparams = parse_args()
 # 모델 로드
 model = YOLO('yolo11m.pt')  # .pt 파일만 지정하면 자동으로 yaml과 가중치 로드
 
-# 차분 로스 하이퍼파라미터를 별도로 저장
+# 차분 로스 하이퍼파라미터를 별도로 저장 (trainer args에 주입)
 npp_params = {
     'npp_alpha': hyperparams['npp_alpha'],
     'npp_beta': hyperparams['npp_beta'],
-    'npp_fpn_sources': hyperparams['npp_fpn_sources']
+    'npp_fpn_sources': hyperparams['npp_fpn_sources'],
+    'npp_lambda_2d': hyperparams['npp_lambda_2d'],
+    'npp_lambda_1d': hyperparams['npp_lambda_1d'],
+    'npp_bbox_mask_weight': hyperparams['npp_bbox_mask_weight'],
 }
 
-# 하이퍼파라미터 기반 프로젝트 이름 생성
+# 하이퍼파라미터 기반 프로젝트 이름 생성 (mask 포함 — grid 조합별 고유 경로)
 FPN_STR = hyperparams['npp_fpn_sources'].replace(',', '_')
-PROJECT_NAME = f"train_diff_alpha{hyperparams['npp_alpha']}_beta{hyperparams['npp_beta']}_fpn{FPN_STR}"
+_m = hyperparams['npp_bbox_mask_weight']
+_L2_DEF, _L1_DEF = 0.02, 0.06
+_default_multi = (
+    abs(hyperparams['npp_lambda_2d'] - _L2_DEF) < 1e-9
+    and abs(hyperparams['npp_lambda_1d'] - _L1_DEF) < 1e-9
+)
+if hyperparams['npp_alpha'] > 0.0 or hyperparams['npp_beta'] > 0.0:
+    if _default_multi or (
+        hyperparams['npp_lambda_2d'] <= 0.0 and hyperparams['npp_lambda_1d'] <= 0.0
+    ):
+        PROJECT_NAME = (
+            f"train_diff_alpha{hyperparams['npp_alpha']}_beta{hyperparams['npp_beta']}_"
+            f"mask{_m}_fpn{FPN_STR}"
+        )
+    else:
+        PROJECT_NAME = (
+            f"train_combo_l2d{hyperparams['npp_lambda_2d']}_l1d{hyperparams['npp_lambda_1d']}_"
+            f"mask{_m}_fpn{FPN_STR}_alpha{hyperparams['npp_alpha']}_beta{hyperparams['npp_beta']}"
+        )
+else:
+    PROJECT_NAME = (
+        f"train_npp_l2d{hyperparams['npp_lambda_2d']}_l1d{hyperparams['npp_lambda_1d']}_"
+        f"mask{_m}_fpn{FPN_STR}"
+    )
 
 # overrides에는 표준 인자만 포함 (NPP 인자는 check_dict_alignment에서 에러 발생)
 # 명령줄 인자에서 받은 값 사용 (없으면 기본값)
@@ -114,7 +153,14 @@ class CustomDetectionTrainer(DetectionTrainer):
         
         # 차분 로스 관련 인자를 제거한 args 복사본 생성
         validator_args = copy(self.args)
-        npp_arg_names = ['npp_alpha', 'npp_beta', 'npp_fpn_sources']
+        npp_arg_names = [
+            'npp_alpha',
+            'npp_beta',
+            'npp_fpn_sources',
+            'npp_lambda_2d',
+            'npp_lambda_1d',
+            'npp_bbox_mask_weight',
+        ]
         for npp_arg in npp_arg_names:
             if hasattr(validator_args, npp_arg):
                 delattr(validator_args, npp_arg)

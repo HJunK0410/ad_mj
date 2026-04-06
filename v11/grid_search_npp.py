@@ -8,6 +8,7 @@ import csv
 import os
 import re
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -19,7 +20,7 @@ os.environ["PYTHONPATH"] = str(script_dir) + ":" + os.environ.get("PYTHONPATH", 
 
 FOLDER_VERSION = script_dir.name  # v8, v10, v11
 STAGE2_CSV = Path("/home/user/hyunjun/AD/stage2_test_eval_results.csv")
-REDUCED_RESULTS_DIR = Path("/home/user/hyunjun/ad/reduced_train")
+REDUCED_RESULTS_DIR = Path("/home/user/hyunjun/AD/reduced_train")
 REDUCED_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_CSV = REDUCED_RESULTS_DIR / f"{FOLDER_VERSION}_top3_subset_results.csv"
 
@@ -34,6 +35,7 @@ EPOCHS = 400
 PATIENCE = 20
 BATCH = 4
 DEVICE = 0
+PYTHON_BIN = os.environ.get("PYTHON_BIN") or sys.executable
 
 
 def parse_npp_from_save_dir(save_dir: str):
@@ -107,7 +109,7 @@ def read_metrics(project_dir: str, run_name: str):
 def build_command(exp: dict, ratio: int, data_yaml: str, project_dir: str, run_name: str):
     if exp["type"] == "baseline":
         return [
-            "python",
+            PYTHON_BIN,
             "train_baseline.py",
             f"--batch={BATCH}",
             f"--device={DEVICE}",
@@ -119,7 +121,7 @@ def build_command(exp: dict, ratio: int, data_yaml: str, project_dir: str, run_n
         ]
 
     return [
-        "python",
+        PYTHON_BIN,
         "train.py",
         f"--npp_lambda_2d={exp['npp_lambda_2d']}",
         f"--npp_lambda_1d={exp['npp_lambda_1d']}",

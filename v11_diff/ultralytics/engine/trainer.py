@@ -416,8 +416,8 @@ class BaseTrainer:
         self.base_lambda_cont_2d = float(getattr(self.args, 'npp_lambda_2d', 0.02))
         self.base_lambda_cont_1d = float(getattr(self.args, 'npp_lambda_1d', 0.06))
         
-        # Bbox 내부 마스크 가중치 - 차분 loss 실험에서는 사용하지 않으므로 1.0으로 고정
-        self.bbox_mask_weight = 1.0
+        # Bbox 내부 마스크 가중치 (train.py에서 주입 가능)
+        self.bbox_mask_weight = float(getattr(self.args, "npp_bbox_mask_weight", 1.0))
         
         # alpha, beta 저장 (npp_loss 호출 시 사용)
         self.npp_alpha = npp_alpha
